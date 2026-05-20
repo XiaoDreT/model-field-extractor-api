@@ -1,0 +1,364 @@
+# src_v2/inference_v2.py
+
+from pathlib import Path
+import re
+import time
+import cv2
+import joblib
+from dateutil import parser as date_parser
+
+try:
+    from .config import (
+        PROJECT_ROOT,
+        IMAGE_DIR,
+        MODEL_DIR,
+        FIELDS,
+        FIELD_CONFIDENCE_THRESHOLD,
+        OCR_MAX_WIDTH,
+    )
+    from .ocr_engine import ReceiptOCREngine
+    from .image_preprocess import resize_for_speed, light_preprocess
+    from .layout_parser import group_tokens_into_lines, build_page_text, normalize_number
+    from .template_router import TemplateRouter
+    from .candidate_generator import CandidateGenerator
+    from .feature_builder import build_candidate_matrix
+    from .rule_parser_v1 import (
+        RuleFieldParserV1,
+        is_amount_candidate,
+        is_human_name_candidate,
+        parse_noisy_transaction_date,
+        safe_parse_date,
+    )
+except ImportError:
+    from config import (
+        PROJECT_ROOT,
+        IMAGE_DIR,
+        MODEL_DIR,
+        FIELDS,
+        FIELD_CONFIDENCE_THRESHOLD,
+        OCR_MAX_WIDTH,
+    )
+    from ocr_engine import ReceiptOCREngine
+    from image_preprocess import resize_for_speed, light_preprocess
+    from layout_parser import group_tokens_into_lines, build_page_text, normalize_number
+    from template_router import TemplateRouter
+    from candidate_generator import CandidateGenerator
+    from feature_builder import build_candidate_matrix
+    from rule_parser_v1 import (
+        RuleFieldParserV1,
+        is_amount_candidate,
+        is_human_name_candidate,
+        parse_noisy_transaction_date,
+        safe_parse_date,
+    )
+
+
+class ReceiptFieldExtractorV2:
+    """
+    Best Model V2:
+    Rule-First Layout-Aware Extractor + Candidate Reranker Fallback.
+
+    Perubahan utama:
+    - Single-pass OCR (tanpa ROI OCR berulang) untuk latency.
+    - Parser rule V1 sebagai sumber utama (akurasi).
+    - Model reranker V2 dipakai sebagai fallback terkontrol.
+    """
+
+    def __init__(self, model_dir=MODEL_DIR):
+        self.model_dir = Path(model_dir)
+
+        self.ocr = ReceiptOCREngine()
+        self.router = TemplateRouter()
+        self.generator = CandidateGenerator()
+        self.rule_parser = RuleFieldParserV1()
+
+        self.models = {}
+
+        for field in FIELDS:
+            model_path = self.model_dir / f"{field}.joblib"
+
+            if model_path.exists():
+                self.models[field] = joblib.load(model_path)
+
+    def empty_response(self):
+        return {
+            "reference_no": None,
+            "transaction_date": None,
+            "account_no": None,
+            "recipient_name": None,
+            "total_amount": None,
+        }
+
+    def predict(self, image_path: str, return_meta: bool = False):
+        start = time.perf_counter()
+
+        image_path = Path(image_path).expanduser()
+
+        # Jika path relatif dijalankan dari direktori selain root project,
+        # fallback ke root project agar tetap konsisten.
+        if not image_path.is_absolute() and not image_path.exists():
+            fallback_path = PROJECT_ROOT / image_path
+            if fallback_path.exists():
+                image_path = fallback_path
+
+        if not image_path.exists():
+            raise FileNotFoundError(f"Image tidak ditemukan: {image_path}")
+
+        image = cv2.imread(str(image_path))
+
+        if image is None:
+            raise ValueError(f"Image gagal dibaca: {image_path}")
+
+        image, _ = resize_for_speed(image, max_width=OCR_MAX_WIDTH)
+
+        # Single-pass OCR untuk menghindari bottleneck ROI OCR per-field.
+        processed = light_preprocess(image)
+
+        h, w = processed.shape[:2]
+
+        tokens = self.ocr.run_ocr(processed)
+        lines = group_tokens_into_lines(tokens)
+        page_text = build_page_text(lines)
+
+        route = self.router.detect_template(page_text)
+        template_name = route["template"]
+
+        # Rule parser V1 sebagai prioritas utama.
+        rule_outputs = self.rule_parser.extract(lines=lines, template_name=template_name)
+
+        # Jalankan model fallback hanya untuk field rule yang lemah/kosong
+        # agar latency lebih rendah.
+        need_model_fields = []
+        for field in FIELDS:
+            rule_score = float(rule_outputs.get(field, {}).get("confidence", 0.0))
+            rule_value = rule_outputs.get(field, {}).get("value")
+            if rule_value is None or rule_score < 0.68:
+                need_model_fields.append(field)
+
+        candidates_by_field = self.generator.generate(lines) if need_model_fields else {}
+
+        result = self.empty_response()
+        confidence = {}
+        needs_review = {}
+        field_source = {}
+
+        for field in FIELDS:
+            if field in need_model_fields:
+                model_value, model_score = self.select_best_candidate(
+                    field=field,
+                    candidates=candidates_by_field.get(field, []),
+                    image_width=w,
+                    image_height=h,
+                    template_name=template_name,
+                )
+            else:
+                model_value, model_score = None, 0.0
+
+            rule_value = rule_outputs.get(field, {}).get("value")
+            rule_score = float(rule_outputs.get(field, {}).get("confidence", 0.0))
+
+            value, score, source = self.resolve_field_value(
+                field=field,
+                rule_value=rule_value,
+                rule_score=rule_score,
+                model_value=model_value,
+                model_score=float(model_score),
+            )
+
+            value = self.postprocess_value(field, value)
+
+            result[field] = value
+            confidence[field] = round(float(score), 4) if score is not None else 0.0
+            needs_review[field] = confidence[field] < FIELD_CONFIDENCE_THRESHOLD[field]
+            field_source[field] = source
+
+        latency = time.perf_counter() - start
+
+        if return_meta:
+            return {
+                "data": result,
+                "confidence": confidence,
+                "needs_review": needs_review,
+                "source": field_source,
+                "template": template_name,
+                "template_score": route["score"],
+                "latency_seconds": round(latency, 4),
+            }
+
+        return result
+
+    def resolve_field_value(
+        self,
+        field,
+        rule_value,
+        rule_score,
+        model_value,
+        model_score,
+    ):
+        """
+        Gabungkan rule-based output dan model fallback secara aman.
+        """
+        has_rule = rule_value is not None
+        has_model = model_value is not None
+        model_valid = self.is_model_value_valid(field, model_value)
+
+        if has_rule and rule_score >= 0.62:
+            return rule_value, rule_score, "rules_v1"
+
+        if has_model and model_valid and model_score >= 0.86:
+            return model_value, model_score, "model_fallback"
+
+        if has_rule:
+            return rule_value, max(rule_score, 0.55), "rules_v1_low"
+
+        if has_model and model_valid:
+            return model_value, max(model_score, 0.45), "model_fallback_low"
+
+        return None, 0.0, "none"
+
+    def is_model_value_valid(self, field, value):
+        if value is None:
+            return False
+
+        if field == "total_amount":
+            return is_amount_candidate(str(value))
+
+        if field == "recipient_name":
+            return is_human_name_candidate(str(value))
+
+        if field == "account_no":
+            digits = normalize_number(str(value))
+            if not (8 <= len(digits) <= 16):
+                return False
+            if re.fullmatch(r"20\d{2}\d{2}\d{2}\d{2,4}", digits):
+                return False
+            if re.fullmatch(r"\d{2}20\d{2}\d{2}\d{2}\d{2,4}", digits):
+                return False
+            if self.rule_parser.known_accounts and digits not in self.rule_parser.known_accounts:
+                return False
+            return True
+
+        if field == "reference_no":
+            return self.rule_parser._is_reference_candidate(str(value))  # pylint: disable=protected-access
+
+        if field == "transaction_date":
+            return self.parse_date(value) is not None
+
+        return True
+
+    def select_best_candidate(
+        self,
+        field,
+        candidates,
+        image_width,
+        image_height,
+        template_name=None,
+    ):
+        """
+        Memilih kandidat terbaik dengan model per field.
+        """
+        if not candidates:
+            return None, 0.0
+
+        model = self.models.get(field)
+
+        # Fallback jika model field belum ada.
+        if model is None:
+            return candidates[0]["value"], 0.25
+
+        X = build_candidate_matrix(
+            candidates,
+            image_width=image_width,
+            image_height=image_height,
+            template_name=template_name,
+        )
+
+        proba = model.predict_proba(X)[:, 1]
+
+        best_idx = int(proba.argmax())
+        best_candidate = candidates[best_idx]
+        best_score = float(proba[best_idx])
+
+        return best_candidate["value"], best_score
+
+    def postprocess_value(self, field, value):
+        """
+        Final normalization agar response JSON konsisten.
+        """
+        if value is None:
+            return None
+
+        if field == "total_amount":
+            digits = normalize_number(str(value))
+            return int(digits) if digits else None
+
+        if field == "account_no":
+            digits = normalize_number(str(value))
+            return digits if digits else None
+
+        if field == "reference_no":
+            return str(value).replace(" ", "").strip()
+
+        if field == "recipient_name":
+            return " ".join(str(value).split()).strip()
+
+        if field == "transaction_date":
+            return self.parse_date(value)
+
+        return value
+
+    def parse_date(self, value):
+        """
+        Parse tanggal ke format standar.
+        """
+        if not value:
+            return None
+
+        text = str(value)
+
+        # Jika sudah dalam format final, hindari reparsing yang bisa
+        # menukar month/day.
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}", text.strip()):
+            return text.strip()
+
+        # Normalisasi beberapa noise OCR umum
+        text = text.replace("WIB", "")
+        text = text.replace("|", " ")
+        text = text.replace(",", " ")
+
+        parsed_noisy = parse_noisy_transaction_date(text)
+        if parsed_noisy:
+            return parsed_noisy
+
+        parsed_safe = safe_parse_date(text)
+        if parsed_safe:
+            return parsed_safe
+
+        try:
+            dt = date_parser.parse(
+                text,
+                fuzzy=True,
+                dayfirst=True,
+            )
+
+            if dt.year < 2000:
+                return None
+
+            return dt.strftime("%Y-%m-%d %H:%M")
+
+        except Exception:
+            return None
+
+
+if __name__ == "__main__":
+    extractor = ReceiptFieldExtractorV2()
+
+    sample_image = IMAGE_DIR / "1.jpg"
+
+    output = extractor.predict(
+        str(sample_image),
+        return_meta=True
+    )
+
+    import json
+    print(json.dumps(output, indent=2, ensure_ascii=False))

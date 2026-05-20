@@ -64,7 +64,7 @@ def health():
     }
 
 
-@app.post("/v2/extract")
+@app.post("/extract")
 async def extract_receipt(
     request: Request,
     file: Optional[UploadFile] = File(default=None),

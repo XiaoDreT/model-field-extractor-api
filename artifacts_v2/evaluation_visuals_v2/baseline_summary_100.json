@@ -1,0 +1,38 @@
+{
+  "label": "Before hard-case debugging",
+  "samples": 100,
+  "overall_accuracy": 0.8543,
+  "latency": {
+    "mean": 1.3745,
+    "p95": 2.1217,
+    "max": 2.5871,
+    "under_1s_ratio": null
+  },
+  "per_field": {
+    "reference_no": {
+      "accuracy": 0.7536,
+      "correct": 52,
+      "total": 69
+    },
+    "transaction_date": {
+      "accuracy": 0.6854,
+      "correct": 61,
+      "total": 89
+    },
+    "account_no": {
+      "accuracy": 0.9271,
+      "correct": 89,
+      "total": 96
+    },
+    "recipient_name": {
+      "accuracy": 0.899,
+      "correct": 89,
+      "total": 99
+    },
+    "total_amount": {
+      "accuracy": 0.96,
+      "correct": 96,
+      "total": 100
+    }
+  }
+}

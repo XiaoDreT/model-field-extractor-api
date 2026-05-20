@@ -66,9 +66,13 @@ REFERENCE_ANCHOR_HINTS = (
     "no.referensi",
     "no. ref",
     "no ref",
+    "ref id",
     "reference id",
     "reference no",
     "reference number",
+    "rincian referensi",
+    "detail referensi",
+    "referensi",
     "biz id",
     "nomor transaksi",
     "id transaksi",
@@ -99,16 +103,23 @@ NEGATIVE_NAME_ANCHORS = (
 AMOUNT_PRIORITY_ANCHORS = (
     "nominal transfer",
     "jumlah transfer",
-    "nominal",
-    "amount",
+    "nominal transaksi",
+    "jumlah kirim",
     "total bayar",
 )
 
 AMOUNT_NEGATIVE_HINTS = (
     "biaya",
+    "biaya adm",
+    "biaya admin",
+    "biaya transaksi",
+    "biaya transfer",
+    "transaction fee",
     "admin",
+    "adm",
     "fee",
     "total debit",
+    "debit amount",
     "total charges",
     "online fee",
 )
@@ -641,7 +652,7 @@ class RuleFieldParserV1:
             if best is None or score > best[0]:
                 best = (score, lex_value)
 
-        if best and best[0] >= 0.90:
+        if best and best[0] >= 0.86:
             return best[1]
 
         return raw
@@ -658,6 +669,26 @@ class RuleFieldParserV1:
     def _compact(text: str) -> str:
         return re.sub(r"\s+", "", str(text))
 
+    @staticmethod
+    def _normalize_hint_text(text: str) -> str:
+        norm = normalize_text(text)
+        norm = re.sub(r"[^a-z0-9]+", " ", norm)
+        return re.sub(r"\s+", " ", norm).strip()
+
+    def _contains_hint(self, text: str, hints: Tuple[str, ...]) -> bool:
+        norm = self._normalize_hint_text(text)
+        if not norm:
+            return False
+
+        compact = norm.replace(" ", "")
+        for hint in hints:
+            hint_norm = self._normalize_hint_text(hint)
+            if not hint_norm:
+                continue
+            if hint_norm in norm or hint_norm.replace(" ", "") in compact:
+                return True
+        return False
+
     def _is_dana_layout(self, lines: List[Dict]) -> bool:
         norms = [normalize_text(l.get("text", "")) for l in lines]
         has_dana = any(n == "dana" or "id dana" in n for n in norms)
@@ -666,8 +697,10 @@ class RuleFieldParserV1:
         return has_dana and has_total_bayar and has_id_trans
 
     def _is_blu_layout(self, lines: List[Dict]) -> bool:
-        norms = [normalize_text(l.get("text", "")) for l in lines]
-        return any(("ref blu" in n) or ("no ref blu" in n) or ("no. ref blu" in n) for n in norms)
+        return any(
+            self._contains_hint(l.get("text", ""), ("ref blu", "no ref blu", "no. ref blu"))
+            for l in lines
+        )
 
     def _is_seabank_layout(self, lines: List[Dict]) -> bool:
         norms = [normalize_text(l.get("text", "")) for l in lines]
@@ -722,7 +755,7 @@ class RuleFieldParserV1:
         return text
 
     def _is_reference_noise(self, text: str) -> bool:
-        norm = normalize_text(text)
+        norm = self._normalize_hint_text(text)
         if not norm:
             return True
 
@@ -739,6 +772,10 @@ class RuleFieldParserV1:
             "instruction",
             "tanggal",
             "waktu",
+            "download",
+            "bintang",
+            "appstore",
+            "google play",
         )
 
         return any(h in norm for h in noise_hints)
@@ -749,10 +786,11 @@ class RuleFieldParserV1:
             return None
 
         raw = re.sub(
-            r"(?i)^(no\.?ref(?:erensi|erence)?|no\.?referensi|no\.?transaksi|noref(?:erensi|erence)?|notransaksi|nomorreferensi|nomortransaksi|reference(?:id|no|number)|bizid)[:\-]*",
+            r"(?i)^(no\.?ref(?:erensi|erence)?|refid|ref\.?id|no\.?referensi|no\.?transaksi|noref(?:erensi|erence)?|notransaksi|nomorreferensi|nomortransaksi|reference(?:id|no|number)|bizid|idtransaksi|rincianreferensi|detailreferensi|ordersn|orderid)[:\-]*",
             "",
             raw,
         )
+        raw = re.sub(r"(?i)^id(?=[A-Za-z0-9]{8,}$)", "", raw)
         raw = re.sub(r"^[^A-Za-z0-9]+|[^A-Za-z0-9]+$", "", raw)
         raw = raw.replace("BMRIDJA", "BMRIIDJA")
         raw = raw.replace("BMRI1DJA", "BMRIIDJA")
@@ -763,7 +801,7 @@ class RuleFieldParserV1:
 
     def _extract_reference_from_anchor_line(self, raw: str) -> Optional[str]:
         anchor_match = re.search(
-            r"(?i)(?:no\.?\s*referensi|no\.?\s*transaksi|nomor\s*referensi|nomor\s*transaksi|reference\s*(?:id|no|number)|biz\s*id|no\.?\s*ref\.?)",
+            r"(?i)(?:id\s*transaksi|idtransaksi|no\.?\s*referensi|no\.?\s*transaksi|nomor\s*referensi|nomor\s*transaksi|reference\s*(?:id|no|number)|ref\.?\s*id|biz\s*id|no\.?\s*ref\.?|rincian\s*referensi|detail\s*referensi)",
             raw,
         )
         if not anchor_match:
@@ -780,12 +818,18 @@ class RuleFieldParserV1:
             normalized = self._normalize_reference_value(chunk)
             if not normalized:
                 continue
-            if not self._is_reference_candidate(normalized):
+            anchored_numeric = (
+                bool(re.fullmatch(r"\d{8,30}", normalize_number(normalized)))
+                and not bool(re.search(r"[A-Za-z]", normalized))
+            )
+            if not self._is_reference_candidate(normalized) and not anchored_numeric:
                 continue
 
             score = len(normalized)
             if re.search(r"[A-Za-z]", normalized) and re.search(r"\\d", normalized):
                 score += 8
+            if anchored_numeric:
+                score += 4
             scored.append((score, normalized))
 
         if not scored:
@@ -794,15 +838,130 @@ class RuleFieldParserV1:
         scored.sort(reverse=True)
         return scored[0][1]
 
+    def _extract_reference_continuation(self, raw: str) -> Optional[str]:
+        if not raw:
+            return None
+
+        norm = self._normalize_hint_text(raw)
+        if not norm:
+            return None
+
+        stop_hints = (
+            "tanggal",
+            "waktu",
+            "biaya",
+            "nominal",
+            "total",
+            "metode",
+            "tujuan",
+            "penerima",
+            "pengirim",
+            "rekening",
+            "account",
+        )
+        if any(h in norm for h in stop_hints):
+            return None
+
+        if is_datetime_like(raw):
+            return None
+
+        hyphenated = re.search(r"([A-Za-z0-9]{2,}(?:-[A-Za-z0-9]{2,})+)", str(raw))
+        if hyphenated:
+            normalized = self._normalize_reference_value(hyphenated.group(1))
+            if normalized and re.search(r"\d", normalized):
+                return normalized
+
+        best = None
+        for chunk in re.findall(r"[A-Za-z0-9]{4,}", str(raw)):
+            normalized = self._normalize_reference_value(chunk)
+            if not normalized:
+                continue
+            if not re.search(r"\d", normalized):
+                continue
+            if len(normalized) > 20:
+                continue
+            if best is None or len(normalized) > len(best):
+                best = normalized
+        return best
+
+    def _merge_reference_with_next_lines(
+        self,
+        base_value: str,
+        ordered_lines: List[Dict],
+        line_index: int,
+    ) -> str:
+        base = self._normalize_reference_value(base_value)
+        if not base:
+            return base_value
+
+        merged_best = base
+
+        def merge_parts(lhs: str, rhs: str) -> str:
+            if not rhs:
+                return lhs
+            if rhs in lhs:
+                return lhs
+            if lhs in rhs:
+                return rhs
+
+            if "-" in lhs and "-" in rhs:
+                left_parts = [p for p in lhs.split("-") if p]
+                right_parts = [p for p in rhs.split("-") if p]
+                if left_parts and right_parts:
+                    if right_parts[-1] == left_parts[-1]:
+                        return "-".join(left_parts[:-1] + right_parts)
+                    if right_parts[0] == left_parts[-1]:
+                        return "-".join(left_parts + right_parts[1:])
+
+            max_overlap = min(len(lhs), len(rhs), 16)
+            overlap = 0
+            for k in range(max_overlap, 2, -1):
+                if lhs.endswith(rhs[:k]):
+                    overlap = k
+                    break
+            if overlap > 0:
+                return lhs + rhs[overlap:]
+            return lhs + rhs
+
+        for j in range(line_index + 1, min(line_index + 3, len(ordered_lines))):
+            if self._line_distance(ordered_lines[line_index], ordered_lines[j]) > 55:
+                continue
+
+            tail = self._extract_reference_continuation(str(ordered_lines[j].get("text", "")))
+            if not tail:
+                continue
+
+            for merged in (merge_parts(merged_best, tail), f"{merged_best}-{tail}"):
+                compact = self._normalize_reference_value(merged)
+                if not compact:
+                    continue
+
+                has_alpha = bool(re.search(r"[A-Za-z]", compact))
+                digit_len = len(normalize_number(compact))
+                is_valid = self._is_reference_candidate(compact) or digit_len >= 12
+                if not is_valid:
+                    continue
+
+                if has_alpha and len(compact) > len(merged_best):
+                    merged_best = compact
+                elif not has_alpha and digit_len > len(normalize_number(merged_best)):
+                    merged_best = compact
+
+        return merged_best
+
     def _is_reference_candidate(self, text: str) -> bool:
-        raw = self._compact(text)
+        original = str(text).strip()
+        raw = self._compact(original)
         if not raw:
             return False
 
-        if self._is_reference_noise(text):
+        if self._is_reference_noise(original):
             return False
 
         if re.match(r"(?i)^(ke|to)\d{8,16}$", raw):
+            return False
+
+        if re.match(r"(?i)^(?:seabank|bankcentralasia|bankbca|bankbri|bankbni|bankmandiri|bca|bri|bni|mandiri){1,3}\d{8,16}$", raw):
             return False
 
         if "*" in raw and raw.count("*") >= 2:
@@ -820,8 +979,15 @@ class RuleFieldParserV1:
         digits = normalize_number(raw)
         has_alpha = bool(re.search(r"[A-Za-z]", raw))
         has_digit = bool(re.search(r"\d", raw))
+        token_count = len(re.findall(r"[A-Za-z0-9]+", original))
 
         if not has_digit:
+            return False
+
+        if " " in original and token_count > 4:
+            return False
+
+        if " " in original and has_alpha and has_digit and len(digits) < 6:
             return False
 
         if has_alpha and has_digit and len(raw) >= 8:
@@ -838,14 +1004,14 @@ class RuleFieldParserV1:
         # DANA special case: ID transaksi sering split multi-line.
         if self._is_dana_layout(ordered) or template_name == "dana":
             for i, line in enumerate(ordered):
-                norm = normalize_text(line.get("text", ""))
-                if "id transaksi" not in norm and "id transak" not in norm:
+                norm = str(line.get("text", ""))
+                if not self._contains_hint(norm, ("id transaksi", "id transak")):
                     continue
 
                 merged_digits = normalize_number(line.get("text", ""))
                 if i + 1 < len(ordered):
                     nxt = ordered[i + 1]
-                    if self._line_distance(line, nxt) < 35:
+                    if self._line_distance(line, nxt) <= 45:
                         merged_digits += normalize_number(nxt.get("text", ""))
 
                 if len(merged_digits) >= 16:
@@ -854,8 +1020,7 @@ class RuleFieldParserV1:
         # blu special case.
         if self._is_blu_layout(ordered) or template_name == "blu_bca":
             for i, line in enumerate(ordered):
-                norm = normalize_text(line.get("text", ""))
-                if "ref blu" not in norm:
+                if not self._contains_hint(line.get("text", ""), ("ref blu", "no ref blu", "no. ref blu")):
                     continue
 
                 inline = re.search(r"(?i)ref\s*blu\s*[:\-]?\s*([A-Za-z0-9\-]{8,})", line.get("text", ""))
@@ -864,22 +1029,30 @@ class RuleFieldParserV1:
                     if value:
                         return value, 0.96
 
-                for j in range(i, min(i + 3, len(ordered))):
+                for j in range(max(0, i - 1), min(i + 3, len(ordered))):
                     value = ordered[j].get("text", "")
-                    if self._is_reference_candidate(value):
-                        normalized = self._normalize_reference_value(value)
-                        if normalized:
-                            return normalized, 0.92
+                    normalized = self._normalize_reference_value(value)
+                    if not normalized:
+                        continue
+
+                    anchored_numeric = (
+                        bool(re.fullmatch(r"\d{8,30}", normalize_number(normalized)))
+                        and not bool(re.search(r"[A-Za-z]", normalized))
+                    )
+                    if self._is_reference_candidate(value) or self._is_reference_candidate(normalized) or anchored_numeric:
+                        return normalized, 0.92
 
         candidates: List[Tuple[float, str]] = []
         has_reference_anchor = False
 
         for i, line in enumerate(ordered):
             raw = str(line.get("text", ""))
-            norm = normalize_text(raw)
+            norm = self._normalize_hint_text(raw)
 
             inline_value = self._extract_reference_from_anchor_line(raw)
             if inline_value:
+                inline_value = self._merge_reference_with_next_lines(inline_value, ordered, i)
+
                 # Handle UUID yang terpotong ke baris berikutnya.
                 if (
                     i + 1 < len(ordered)
@@ -893,20 +1066,34 @@ class RuleFieldParserV1:
 
                 return inline_value, 0.99
 
-            if any(h in norm for h in REFERENCE_ANCHOR_HINTS):
+            if self._contains_hint(norm, REFERENCE_ANCHOR_HINTS):
                 has_reference_anchor = True
-                for j in range(i + 1, min(i + 3, len(ordered))):
+                for j in range(i + 1, min(i + 4, len(ordered))):
                     candidate = ordered[j].get("text", "")
-                    if self._is_reference_candidate(candidate):
-                        compact = self._normalize_reference_value(candidate)
-                        if not compact:
-                            continue
-                        score = 0.88
-                        if re.search(r"[A-Za-z]", compact) and re.search(r"\d", compact):
-                            score += 0.08
-                        if len(compact) >= 14:
-                            score += 0.05
-                        candidates.append((score, compact))
+                    compact = self._normalize_reference_value(candidate)
+                    if not compact:
+                        continue
+
+                    anchored_numeric = (
+                        bool(re.fullmatch(r"\d{8,30}", normalize_number(compact)))
+                        and not bool(re.search(r"[A-Za-z]", compact))
+                    )
+                    if not self._is_reference_candidate(candidate) and not self._is_reference_candidate(compact) and not anchored_numeric:
+                        continue
+
+                    merged = self._merge_reference_with_next_lines(compact, ordered, j)
+                    is_merged = len(merged) >= len(compact) + 4
+
+                    score = 0.86
+                    if re.search(r"[A-Za-z]", merged) and re.search(r"\d", merged):
+                        score += 0.09
+                    if anchored_numeric:
+                        score += 0.08
+                    if len(merged) >= 14:
+                        score += 0.05
+                    if is_merged:
+                        score += 0.06
+                    candidates.append((score, merged))
 
         if not candidates:
             for line in ordered:
@@ -1137,8 +1324,7 @@ class RuleFieldParserV1:
     def _extract_amount(self, lines: List[Dict], template_name: Optional[str]) -> Tuple[Optional[int], float]:
         ordered = self._sorted_lines(lines)
 
-        candidates: List[Tuple[float, int]] = []
-        nominal_candidates: List[Tuple[float, int]] = []
+        entries = []
 
         for line in ordered:
             text = str(line.get("text", ""))
@@ -1148,16 +1334,30 @@ class RuleFieldParserV1:
             if value is None or not is_amount_candidate(text):
                 continue
 
-            score = 0.58
+            score = 0.52
+            is_total_anchor = self._contains_hint(
+                text,
+                ("total transaksi", "total debit", "debit amount", "total nominal", "jumlah total", "total"),
+            )
+            is_nominal_anchor = self._contains_hint(text, AMOUNT_PRIORITY_ANCHORS) or self._contains_hint(text, ("kirim uang",))
+            if (not is_nominal_anchor) and ("jumlah" in norm) and ("total" not in norm) and ("biaya" not in norm):
+                is_nominal_anchor = True
+            if (not is_nominal_anchor) and ("nominal" in norm) and (not is_total_anchor) and ("biaya" not in norm):
+                is_nominal_anchor = True
+            is_fee_anchor = self._contains_hint(text, AMOUNT_NEGATIVE_HINTS)
+            fee_is_waived = bool(re.search(r"\b(gratis|free)\b", norm))
 
-            if any(a in norm for a in AMOUNT_PRIORITY_ANCHORS):
-                score += 0.5
+            if is_nominal_anchor:
+                score += 0.52
 
-            if any(n in norm for n in AMOUNT_NEGATIVE_HINTS):
-                score -= 0.8
+            if is_total_anchor:
+                score += 0.16
+
+            if is_fee_anchor:
+                score -= 0.95
 
             if "total transaksi" in norm and any("nominal transfer" in normalize_text(l.get("text", "")) for l in ordered):
-                score -= 0.45
+                score -= 0.25
 
             if "rp" in norm or "idr" in norm:
                 score += 0.2
@@ -1166,25 +1366,52 @@ class RuleFieldParserV1:
                 score += 0.12
 
             if template_name == "livin_mandiri" and ("nominal transfer" in norm or "jumlah transfer" in norm):
-                score += 0.4
+                score += 0.28
 
             if self._is_dana_layout(ordered) and "total bayar" in norm:
-                score += 0.45
+                score += 0.22
 
-            if "nominal transfer" in norm or "jumlah transfer" in norm:
-                nominal_candidates.append((score + 0.18, value))
+            entries.append({
+                "score": score,
+                "value": value,
+                "is_nominal": is_nominal_anchor and not is_fee_anchor,
+                "is_total": is_total_anchor and not is_fee_anchor,
+                "is_fee": is_fee_anchor,
+                "fee_value": 0 if fee_is_waived else value,
+            })
 
-            candidates.append((score, value))
-
-        if nominal_candidates:
-            nominal_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-            return nominal_candidates[0][1], min(0.99, nominal_candidates[0][0])
-
-        if not candidates:
+        if not entries:
             return None, 0.0
 
-        candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
-        return candidates[0][1], min(0.99, candidates[0][0])
+        nominal_candidates = [e for e in entries if e["is_nominal"]]
+        total_candidates = [e for e in entries if e["is_total"]]
+        fee_candidates = [e for e in entries if e["is_fee"]]
+        non_fee_candidates = [e for e in entries if not e["is_fee"]]
+
+        if nominal_candidates:
+            nominal_candidates.sort(key=lambda x: (x["score"], x["value"]), reverse=True)
+            best = nominal_candidates[0]
+            return best["value"], min(0.99, best["score"])
+
+        if total_candidates and fee_candidates:
+            total_candidates.sort(key=lambda x: (x["score"], x["value"]), reverse=True)
+            fee_candidates.sort(key=lambda x: (x["score"], x["value"]), reverse=True)
+            top_total = total_candidates[0]
+            top_fee = fee_candidates[0]
+
+            derived_nominal = int(top_total["value"]) - int(top_fee.get("fee_value", top_fee["value"]))
+            if MIN_AMOUNT <= derived_nominal <= MAX_AMOUNT and derived_nominal < int(top_total["value"]):
+                derived_score = min(0.95, max(0.74, top_total["score"] + 0.06))
+                return derived_nominal, derived_score
+
+        if non_fee_candidates:
+            non_fee_candidates.sort(key=lambda x: (x["score"], x["value"]), reverse=True)
+            best = non_fee_candidates[0]
+            return best["value"], min(0.99, best["score"])
+
+        # Jika hanya ada biaya admin/fee, lebih aman return None agar
+        # tidak mengembalikan total_amount yang salah.
+        return None, 0.0
 
     def _has_transaction_date_signal(self, lines: List[Dict]) -> bool:
         norms = [normalize_text(l.get("text", "")) for l in lines]

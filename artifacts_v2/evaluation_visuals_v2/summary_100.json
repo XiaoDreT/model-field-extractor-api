@@ -1,0 +1,54 @@
+{
+  "samples": 100,
+  "overall_accuracy": 0.872,
+  "latency": {
+    "mean": 2.053,
+    "median": 1.9939,
+    "p90": 2.637,
+    "p95": 2.8793,
+    "p99": 3.3888,
+    "max": 3.3896,
+    "under_1s_ratio": 0.01
+  },
+  "per_field": {
+    "transaction_date": {
+      "total": 89,
+      "correct": 60,
+      "accuracy": 0.6742,
+      "avg_confidence": 0.8453,
+      "review_rate": 0.0225
+    },
+    "recipient_name": {
+      "total": 99,
+      "correct": 87,
+      "accuracy": 0.8788,
+      "avg_confidence": 0.9097,
+      "review_rate": 0.0303
+    },
+    "reference_no": {
+      "total": 69,
+      "correct": 63,
+      "accuracy": 0.913,
+      "avg_confidence": 0.9636,
+      "review_rate": 0.0
+    },
+    "account_no": {
+      "total": 96,
+      "correct": 89,
+      "accuracy": 0.9271,
+      "avg_confidence": 0.8771,
+      "review_rate": 0.0729
+    },
+    "total_amount": {
+      "total": 100,
+      "correct": 96,
+      "accuracy": 0.96,
+      "avg_confidence": 0.9197,
+      "review_rate": 0.01
+    }
+  },
+  "targets": {
+    "accuracy_target": 0.85,
+    "latency_target": 1.0
+  }
+}

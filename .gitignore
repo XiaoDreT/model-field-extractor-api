@@ -1,4 +1,5 @@
-data/*
+data/images/*
+data/gambar_receipts.zip
 artifacts_v2/runtime/*
 artifacts_v2/template_bank.json
 artifacts_v2/config.json

@@ -213,6 +213,7 @@ class ReceiptFieldExtractorV2:
         mapped = self.rule_parser.account_recipient_map.get(account_no)
         if not mapped:
             return
+        mapped = self.rule_parser._normalize_recipient_name_case(mapped) or mapped  # pylint: disable=protected-access
 
         current = result.get("recipient_name")
         current_score = float(confidence.get("recipient_name", 0.0))
@@ -388,7 +389,11 @@ class ReceiptFieldExtractorV2:
             return str(value).replace(" ", "").strip()
 
         if field == "recipient_name":
-            return " ".join(str(value).split()).strip()
+            cleaned = " ".join(str(value).split()).strip()
+            normalized = self.rule_parser._normalize_recipient_name_case(cleaned)  # pylint: disable=protected-access
+            if normalized:
+                return normalized
+            return cleaned
 
         if field == "transaction_date":
             return self.parse_date(value)
@@ -441,7 +446,7 @@ class ReceiptFieldExtractorV2:
 if __name__ == "__main__":
     extractor = ReceiptFieldExtractorV2()
 
-    sample_image = IMAGE_DIR / "12.jpg"
+    sample_image = IMAGE_DIR / "2833.jpg"
 
     output = extractor.predict(
         str(sample_image),

@@ -270,7 +270,7 @@ def is_amount_candidate(text: str) -> bool:
 def clean_name_text(text: str) -> str:
     value = re.sub(r"\s+", " ", str(text)).strip()
     value = re.sub(r"^[^A-Za-z]+|[^A-Za-z .'-]+$", "", value).strip()
-    value = re.sub(r"(?i)^(nama(\s+penerima)?|penerima|recipient|beneficiary)\s*[:\-]\s*", "", value)
+    value = re.sub(r"(?i)^(nama(\s*penerima)?|namapenerima|penerima|recipient|beneficiary)\s*[:\-]?\s*", "", value)
     value = re.sub(r"(?i)^ke\s*[:\-]\s*", "", value)
     value = re.sub(r"(?i)^transfer\s+(ke|to)\s+", "", value)
     value = re.split(r"(?i)\s*[-|]\s*(bca|bri|bni|mandiri|seabank|cimb|bsi)\b", value)[0]
@@ -311,8 +311,24 @@ def is_human_name_candidate(text: str) -> bool:
         "dana",
         "ovo",
         "seabank",
+        "kantorpusat",
+        "kantor pusat",
+        "persero",
+        "npwp",
+        "otoritas jasa keuangan",
+        "terdaftar dan diawasi",
+        "apabila",
+        "dikenakan",
+        "biaya termasuk",
+        "office",
+        "tower",
+        "lantai",
     )
     if any(fragment in norm for fragment in bad_fragments):
+        return False
+
+    # Watermark OCR noise pada struk bank sering muncul seperti "rbri bbri brri".
+    if len(words) >= 2 and all(re.fullmatch(r"[rbiy]{3,5}", w) for w in words):
         return False
 
     if raw.isupper() and len(words) == 1 and len(raw) <= 6:
@@ -731,6 +747,75 @@ class RuleFieldParserV1:
             if hint_norm in norm or hint_norm.replace(" ", "") in compact:
                 return True
         return False
+
+    def _has_positive_name_anchor(self, text: str) -> bool:
+        norm = self._normalize_hint_text(text)
+        if not norm:
+            return False
+
+        compact = norm.replace(" ", "")
+        for anchor in POSITIVE_NAME_ANCHORS:
+            anchor_norm = self._normalize_hint_text(anchor)
+            if not anchor_norm:
+                continue
+
+            # Anchor "ke" harus sebagai token utuh, bukan substring
+            # dari kata lain seperti "dikenakan"/"keuangan".
+            if anchor_norm == "ke":
+                if re.search(r"(^|\s)ke(\s|$)", norm):
+                    return True
+                continue
+
+            if anchor_norm in norm or anchor_norm.replace(" ", "") in compact:
+                return True
+
+        return False
+
+    def _extract_name_lexicon_candidates_from_line(self, text: str) -> List[str]:
+        if not self.recipient_name_lexicon:
+            return []
+
+        noisy_tokens = {
+            "bank",
+            "bankbca",
+            "bankbri",
+            "bankbni",
+            "bankmandiri",
+            "seabank",
+            "transfer",
+            "online",
+            "nominal",
+            "tujuan",
+            "penerima",
+            "sumber",
+            "dana",
+            "catatan",
+            "rekening",
+            "kantor",
+            "pusat",
+            "jakarta",
+            "rbri",
+            "bbri",
+            "ribri",
+            "bibri",
+            "rbry",
+            "bbry",
+            "brri",
+        }
+
+        matches: List[str] = []
+        for token in re.findall(r"[A-Za-z]{6,30}", str(text)):
+            token_norm = token.lower()
+            if token_norm in noisy_tokens:
+                continue
+            if token_norm.startswith("bank"):
+                continue
+
+            lex = self._match_name_lexicon(token)
+            if lex and lex not in matches:
+                matches.append(lex)
+
+        return matches
 
     def _is_dana_layout(self, lines: List[Dict]) -> bool:
         norms = [normalize_text(l.get("text", "")) for l in lines]
@@ -1358,6 +1443,10 @@ class RuleFieldParserV1:
 
     def _extract_name(self, lines: List[Dict], account_no: Optional[str], template_name: Optional[str]) -> Tuple[Optional[str], float]:
         ordered = self._sorted_lines(lines)
+        account_line_indexes = [
+            idx for idx, line in enumerate(ordered)
+            if 8 <= len(normalize_number(line.get("text", ""))) <= 16
+        ]
 
         # blu layout: name biasanya di atas baris "BCA - xxxxx".
         if self._is_blu_layout(ordered) or template_name == "blu_bca":
@@ -1386,12 +1475,13 @@ class RuleFieldParserV1:
         for idx, line in enumerate(ordered):
             text = str(line.get("text", ""))
             norm = normalize_text(text)
+            has_positive_anchor = self._has_positive_name_anchor(text)
 
             inline = self._extract_name_inline(text)
             if inline:
                 candidates.append((0.94, inline))
 
-            if any(a in norm for a in POSITIVE_NAME_ANCHORS):
+            if has_positive_anchor:
                 for j in range(idx, min(idx + 3, len(ordered))):
                     candidate = clean_name_text(ordered[j].get("text", ""))
                     if not is_human_name_candidate(candidate):
@@ -1411,9 +1501,21 @@ class RuleFieldParserV1:
                     score -= 0.5
                 if any(n in norm for n in ("metode", "pembayaran", "saldo", "detail transaksi", "id transaksi")):
                     score -= 0.55
-                if any(p in norm for p in POSITIVE_NAME_ANCHORS):
+                if has_positive_anchor:
                     score += 0.2
                 candidates.append((score, plain))
+
+            for lex_name in self._extract_name_lexicon_candidates_from_line(text):
+                score = 0.84
+                if has_positive_anchor:
+                    score += 0.06
+                if any(abs(idx - account_idx) <= 1 for account_idx in account_line_indexes):
+                    score += 0.08
+                if idx > 0:
+                    prev_norm = self._normalize_hint_text(ordered[idx - 1].get("text", ""))
+                    if ("tujuan" in prev_norm) or ("penerima" in prev_norm) or re.search(r"(^|\s)ke(\s|$)", prev_norm):
+                        score += 0.04
+                candidates.append((min(0.97, score), lex_name))
 
             # Name menempel tanpa spasi: FADHILBAWAZIER
             compact = re.sub(r"[^A-Za-z]", "", text)

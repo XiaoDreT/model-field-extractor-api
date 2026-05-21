@@ -1,6 +1,7 @@
 # src_v2/inference_v2.py
 
 from pathlib import Path
+from difflib import SequenceMatcher
 import re
 import time
 import cv2
@@ -186,6 +187,9 @@ class ReceiptFieldExtractorV2:
             needs_review[field] = confidence[field] < FIELD_CONFIDENCE_THRESHOLD[field]
             field_source[field] = source
 
+        self.apply_recipient_from_account_map(result, confidence, field_source)
+        needs_review["recipient_name"] = confidence["recipient_name"] < FIELD_CONFIDENCE_THRESHOLD["recipient_name"]
+
         latency = time.perf_counter() - start
 
         if return_meta:
@@ -200,6 +204,36 @@ class ReceiptFieldExtractorV2:
             }
 
         return result
+
+    def apply_recipient_from_account_map(self, result, confidence, field_source):
+        account_no = normalize_number(str(result.get("account_no") or ""))
+        if not account_no:
+            return
+
+        mapped = self.rule_parser.account_recipient_map.get(account_no)
+        if not mapped:
+            return
+
+        current = result.get("recipient_name")
+        current_score = float(confidence.get("recipient_name", 0.0))
+
+        should_override = current is None
+        if current is not None:
+            current_key = re.sub(r"[^a-z]", "", str(current).lower())
+            mapped_key = re.sub(r"[^a-z]", "", str(mapped).lower())
+            similarity = SequenceMatcher(None, current_key, mapped_key).ratio() if (current_key and mapped_key) else 0.0
+
+            if not is_human_name_candidate(str(current)):
+                should_override = True
+            elif similarity < 0.62:
+                should_override = True
+            elif similarity < 0.82 and current_score < 0.9:
+                should_override = True
+
+        if should_override:
+            result["recipient_name"] = mapped
+            confidence["recipient_name"] = max(current_score, 0.9)
+            field_source["recipient_name"] = "account_recipient_map"
 
     def should_retry_amount_with_raw_ocr(self, lines, rule_outputs):
         current_amount = rule_outputs.get("total_amount", {}).get("value")
@@ -407,7 +441,7 @@ class ReceiptFieldExtractorV2:
 if __name__ == "__main__":
     extractor = ReceiptFieldExtractorV2()
 
-    sample_image = IMAGE_DIR / "348.jpg"
+    sample_image = IMAGE_DIR / "12.jpg"
 
     output = extractor.predict(
         str(sample_image),

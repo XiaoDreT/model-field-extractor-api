@@ -1,6 +1,12 @@
+import os
 from pathlib import Path
 import cv2
 from rapidocr_onnxruntime import RapidOCR
+
+try:
+    from .config import OCR_CPU_THREADS, OCR_DET_LIMIT_SIDE_LEN, OCR_DET_LIMIT_TYPE
+except ImportError:
+    from config import OCR_CPU_THREADS, OCR_DET_LIMIT_SIDE_LEN, OCR_DET_LIMIT_TYPE
 
 
 class ReceiptOCREngine:
@@ -12,10 +18,24 @@ class ReceiptOCREngine:
     2. ROI OCR untuk mempercepat known template
     """
 
-    def __init__(self):
+    def __init__(self, det_limit_side_len=None, det_limit_type=None):
+        # Thread count rendah lebih stabil/cepat untuk workload OCR per-request.
+        cpu_threads = str(max(1, int(OCR_CPU_THREADS)))
+        os.environ["OMP_NUM_THREADS"] = cpu_threads
+        os.environ["OPENBLAS_NUM_THREADS"] = cpu_threads
+        os.environ["MKL_NUM_THREADS"] = cpu_threads
+
+        side_len = OCR_DET_LIMIT_SIDE_LEN if det_limit_side_len is None else det_limit_side_len
+        limit_type = OCR_DET_LIMIT_TYPE if det_limit_type is None else det_limit_type
+
         # use_angle_cls=False karena receipt mayoritas tegak.
         # Ini mengikuti insight Best Model V1.
-        self.engine = RapidOCR(use_angle_cls=False)
+        self.engine = RapidOCR(
+            use_angle_cls=False,
+            det_limit_side_len=side_len,
+            det_limit_type=limit_type,
+            det_model_path=None,
+        )
 
     def run_ocr(self, image):
         """

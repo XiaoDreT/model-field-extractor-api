@@ -224,6 +224,21 @@ def parse_rupiah_amount_ocr_aware(text: str) -> Optional[int]:
     raw = str(text)
     raw = re.sub(r"(?i)\brp[il](?=\d)", "rp1", raw)
     raw = re.sub(r"(?i)\bidr[il](?=\d)", "idr1", raw)
+
+    # Prioritaskan angka setelah token mata uang untuk menghindari noise digit
+    # sebelum "Rp/IDR", contoh: "Nominal bjbsy 5 Rp.1.015.000".
+    currency_candidates = []
+    for m in re.finditer(r"(?i)(?:rp|idr)\s*[:.]?\s*([0-9][0-9.,]{1,})", raw):
+        candidate_text = m.group(1)
+        value = parse_rupiah_amount(candidate_text)
+        if value is None:
+            continue
+        currency_candidates.append((m.start(), len(candidate_text), value))
+
+    if currency_candidates:
+        currency_candidates.sort(key=lambda x: (x[0], x[1]), reverse=True)
+        return currency_candidates[0][2]
+
     return parse_rupiah_amount(raw)
 
 
@@ -383,6 +398,24 @@ def _extract_time_component(text: str) -> Tuple[int, int]:
     normalized = re.sub(r"(?<=\d)\.(?=\d{2}(?:\D|$))", ":", normalized)
     normalized = re.sub(r"(?i)\b([ilt])(?=\d[:.])", "1", normalized)
     normalized = re.sub(r"(?i)\b([ilt])[-](\d{2})\b", r"14:\2", normalized)
+    normalized = re.sub(r"(?i)(20\d{2})[-\s]*[il](?=[:.][0-5]\d)", r"\g<1>11", normalized)
+
+    # Format fused yang sering muncul di OCR:
+    # - 02Apr202613:56:37 -> 13:56
+    # - 11Sep202417:36 -> 17:36
+    fused_year = re.search(r"20\d{2}([01]\d|2[0-3])[:.]([0-5]\d)(?:[:.]([0-5]\d))?", normalized)
+    if fused_year:
+        return int(fused_year.group(1)), int(fused_year.group(2))
+
+    # OCR kadang menyisipkan 1 ekstra sebelum jam: 2026114:55:40 -> 14:55
+    fused_year_with_extra = re.search(r"20\d{2}\d([01]\d|2[0-3])[:.]([0-5]\d)(?:[:.]([0-5]\d))?", normalized)
+    if fused_year_with_extra:
+        return int(fused_year_with_extra.group(1)), int(fused_year_with_extra.group(2))
+
+    # Format compact hhmm.ss setelah tahun: 20260829.43 -> 08:29
+    fused_compact = re.search(r"20\d{2}([01]\d|2[0-3])([0-5]\d)[:.]([0-5]\d)", normalized)
+    if fused_compact:
+        return int(fused_compact.group(1)), int(fused_compact.group(2))
 
     standard = re.search(r"(?<!\d)([01]?\d|2[0-3])[:.]([0-5]\d)(?:[:.]([0-5]\d))?(?!\d)", normalized)
     if standard:
@@ -404,9 +437,18 @@ def _extract_time_component(text: str) -> Tuple[int, int]:
     if spaced:
         return int(spaced.group(1)), int(spaced.group(2))
 
-    hyphenated = re.search(r"(?<!\d)([01]?\d|2[0-3])[-]([0-5]\d)(?!\d)", normalized)
-    if hyphenated:
-        return int(hyphenated.group(1)), int(hyphenated.group(2))
+    # Batasi format hyphenated agar tidak menelan token referensi seperti
+    # "...6CA3-49CE" menjadi waktu palsu 03:49.
+    has_time_context = bool(
+        re.search(r"\d{1,2}[-/]\d{1,2}[-/]\d{2,4}", normalized)
+        or re.search(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}", normalized)
+        or re.search(rf"\b{MONTH_TOKEN_PATTERN}\b", normalized, flags=re.IGNORECASE)
+        or any(h in normalized for h in DATE_LABEL_HINTS)
+    )
+    if has_time_context:
+        hyphenated = re.search(r"(?<!\d)([01]?\d|2[0-3])[-]([0-5]\d)(?!\d)", normalized)
+        if hyphenated:
+            return int(hyphenated.group(1)), int(hyphenated.group(2))
 
     return 0, 0
 
@@ -421,6 +463,7 @@ def parse_noisy_transaction_date(text: str) -> Optional[str]:
     norm = norm.replace("|", "1")
     norm = norm.replace(";", ":")
     norm = re.sub(r"\bi(?=\d{3,4}[:.])", "1", norm)
+    norm = re.sub(r"(?i)(20\d{2})[-\s]*[il](?=[:.][0-5]\d)", r"\g<1>11", norm)
     norm = re.sub(r"\s+", " ", norm).strip()
 
     # Format OCR fused: 01/04202600:14:44
@@ -454,7 +497,7 @@ def parse_noisy_transaction_date(text: str) -> Optional[str]:
             return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}"
 
     month_first = re.search(
-        r"(?<!\d)([a-z]{3,10})\s+(\d{1,2})(?:,|\s|-)+(20\d{2})(?:\D+([01]?\d|2[0-3])[:.]([0-5]\d))?",
+        r"(?<!\d)([a-z]{3,10})\s*(\d{1,2})(?:,|\s|-)+(20\d{2})(?:\D+([01]?\d|2[0-3])[:.]([0-5]\d))?",
         norm,
     )
     if month_first:
@@ -472,7 +515,7 @@ def parse_noisy_transaction_date(text: str) -> Optional[str]:
                 return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}"
 
     month_text = re.search(
-        r"(?<!\d)(\d{1,2})\s*[-/ ]*\s*([a-z]{3,10})(?:[1l])?\s*[-/ ]*\s*(20\d{2})(?=(?:\D|$|\d{1,2}[:.]\d{2}))",
+        r"(?<!\d)(\d{1,2})\s*[-/ ]*\s*([a-z]{3,10})(?:[1l])?\s*[-/ ]*\s*(20\d{2})(?=(?:\D|$|\d{1,4}[:.]\d{2}))",
         norm,
     )
     if month_text:
@@ -838,12 +881,15 @@ class RuleFieldParserV1:
         scored.sort(reverse=True)
         return scored[0][1]
 
-    def _extract_reference_continuation(self, raw: str) -> Optional[str]:
+    def _extract_reference_continuation(self, raw: str, allow_bifast_tail: bool = True) -> Optional[str]:
         if not raw:
             return None
 
         norm = self._normalize_hint_text(raw)
         if not norm:
+            return None
+
+        if (not allow_bifast_tail) and (("bi fast" in norm) or ("bifast" in norm)):
             return None
 
         stop_hints = (
@@ -889,6 +935,7 @@ class RuleFieldParserV1:
         base_value: str,
         ordered_lines: List[Dict],
         line_index: int,
+        allow_bifast_tail: bool = True,
     ) -> str:
         base = self._normalize_reference_value(base_value)
         if not base:
@@ -927,7 +974,10 @@ class RuleFieldParserV1:
             if self._line_distance(ordered_lines[line_index], ordered_lines[j]) > 55:
                 continue
 
-            tail = self._extract_reference_continuation(str(ordered_lines[j].get("text", "")))
+            tail = self._extract_reference_continuation(
+                str(ordered_lines[j].get("text", "")),
+                allow_bifast_tail=allow_bifast_tail,
+            )
             if not tail:
                 continue
 
@@ -955,6 +1005,8 @@ class RuleFieldParserV1:
         if not raw:
             return False
 
+        norm_hint = self._normalize_hint_text(original)
+
         if self._is_reference_noise(original):
             return False
 
@@ -976,9 +1028,25 @@ class RuleFieldParserV1:
         if is_amount_candidate(raw) and not bool(re.search(r"[A-Za-z]", raw)):
             return False
 
+        # Rekening penerima/sumber bukan reference number.
+        if (
+            ("rek penerima" in norm_hint)
+            or ("rek asal" in norm_hint)
+            or ("rekening penerima" in norm_hint)
+            or ("rekening sumber" in norm_hint)
+            or ("sumber dana" in norm_hint)
+            or ("external serial" in norm_hint)
+            or ("serial number" in norm_hint)
+            or ("id order" in norm_hint)
+            or ("order merchant" in norm_hint)
+            or ("npwp" in norm_hint)
+        ):
+            return False
+
         digits = normalize_number(raw)
         has_alpha = bool(re.search(r"[A-Za-z]", raw))
         has_digit = bool(re.search(r"\d", raw))
+        alpha_len = len(re.findall(r"[A-Za-z]", raw))
         token_count = len(re.findall(r"[A-Za-z0-9]+", original))
 
         if not has_digit:
@@ -988,6 +1056,9 @@ class RuleFieldParserV1:
             return False
 
         if " " in original and has_alpha and has_digit and len(digits) < 6:
+            return False
+
+        if has_alpha and has_digit and len(digits) < 6 and alpha_len >= 8:
             return False
 
         if has_alpha and has_digit and len(raw) >= 8:
@@ -1000,6 +1071,7 @@ class RuleFieldParserV1:
 
     def _extract_reference(self, lines: List[Dict], template_name: Optional[str]) -> Tuple[Optional[str], float]:
         ordered = self._sorted_lines(lines)
+        allow_bifast_tail = template_name != "livin_mandiri"
 
         # DANA special case: ID transaksi sering split multi-line.
         if self._is_dana_layout(ordered) or template_name == "dana":
@@ -1016,6 +1088,29 @@ class RuleFieldParserV1:
 
                 if len(merged_digits) >= 16:
                     return merged_digits, 0.98
+
+            # Fallback DANA: OCR cepat kadang menghilangkan label "ID Transaksi"
+            # namun dua baris digit panjang masih terbaca berurutan.
+            for i, line in enumerate(ordered):
+                current_text = str(line.get("text", ""))
+                current_norm = self._normalize_hint_text(current_text)
+                if any(h in current_norm for h in ("npwp", "order", "serial", "sumber dana", "no.ref")):
+                    continue
+
+                merged_digits = normalize_number(current_text)
+                if len(merged_digits) < 16 or not merged_digits.startswith("20"):
+                    continue
+
+                for j in range(i + 1, min(i + 3, len(ordered))):
+                    nxt = ordered[j]
+                    if self._line_distance(line, nxt) > 45:
+                        continue
+                    nxt_digits = normalize_number(nxt.get("text", ""))
+                    if len(nxt_digits) >= 10:
+                        merged_digits += nxt_digits
+
+                if len(merged_digits) >= 24:
+                    return merged_digits, 0.97
 
         # blu special case.
         if self._is_blu_layout(ordered) or template_name == "blu_bca":
@@ -1044,6 +1139,7 @@ class RuleFieldParserV1:
 
         candidates: List[Tuple[float, str]] = []
         has_reference_anchor = False
+        explicit_empty_reference_anchor = False
 
         for i, line in enumerate(ordered):
             raw = str(line.get("text", ""))
@@ -1051,7 +1147,12 @@ class RuleFieldParserV1:
 
             inline_value = self._extract_reference_from_anchor_line(raw)
             if inline_value:
-                inline_value = self._merge_reference_with_next_lines(inline_value, ordered, i)
+                inline_value = self._merge_reference_with_next_lines(
+                    inline_value,
+                    ordered,
+                    i,
+                    allow_bifast_tail=allow_bifast_tail,
+                )
 
                 # Handle UUID yang terpotong ke baris berikutnya.
                 if (
@@ -1068,6 +1169,18 @@ class RuleFieldParserV1:
 
             if self._contains_hint(norm, REFERENCE_ANCHOR_HINTS):
                 has_reference_anchor = True
+
+                # Jika anchor referensi ada tapi nilainya kosong ("-" / empty),
+                # jangan fallback ke field lain seperti rekening penerima.
+                anchor_tail = re.sub(
+                    r"(?i)^.*?(no\.?\s*referensi|no\.?\s*transaksi|nomor\s*referensi|nomor\s*transaksi|reference\s*(?:id|no|number)|ref\.?\s*id|biz\s*id|no\.?\s*ref\.?|rincian\s*referensi|detail\s*referensi)\s*",
+                    "",
+                    raw,
+                )
+                anchor_tail_compact = re.sub(r"[\s:;._\-]+", "", anchor_tail).lower()
+                if anchor_tail_compact in ("", "na", "n/a"):
+                    explicit_empty_reference_anchor = True
+
                 for j in range(i + 1, min(i + 4, len(ordered))):
                     candidate = ordered[j].get("text", "")
                     compact = self._normalize_reference_value(candidate)
@@ -1081,7 +1194,12 @@ class RuleFieldParserV1:
                     if not self._is_reference_candidate(candidate) and not self._is_reference_candidate(compact) and not anchored_numeric:
                         continue
 
-                    merged = self._merge_reference_with_next_lines(compact, ordered, j)
+                    merged = self._merge_reference_with_next_lines(
+                        compact,
+                        ordered,
+                        j,
+                        allow_bifast_tail=allow_bifast_tail,
+                    )
                     is_merged = len(merged) >= len(compact) + 4
 
                     score = 0.86
@@ -1094,6 +1212,9 @@ class RuleFieldParserV1:
                     if is_merged:
                         score += 0.06
                     candidates.append((score, merged))
+
+        if explicit_empty_reference_anchor and not candidates:
+            return None, 0.99
 
         if not candidates:
             for line in ordered:
@@ -1404,6 +1525,26 @@ class RuleFieldParserV1:
                 derived_score = min(0.95, max(0.74, top_total["score"] + 0.06))
                 return derived_nominal, derived_score
 
+        # Jika OCR anchor total/debit sedikit noisy, gunakan relasi aritmetika
+        # antar kandidat non-fee: total ~= nominal + fee.
+        if fee_candidates and len(non_fee_candidates) >= 2:
+            fee_candidates.sort(key=lambda x: (x["score"], x.get("fee_value", x["value"])), reverse=True)
+            fee_value = int(fee_candidates[0].get("fee_value", fee_candidates[0]["value"]))
+            sorted_non_fee = sorted(non_fee_candidates, key=lambda x: (x["score"], x["value"]), reverse=True)
+
+            for high in sorted_non_fee:
+                for low in sorted_non_fee:
+                    if high is low:
+                        continue
+                    high_value = int(high["value"])
+                    low_value = int(low["value"])
+                    if high_value <= low_value:
+                        continue
+                    diff = high_value - low_value
+                    if abs(diff - fee_value) <= 250:
+                        combo_score = min(0.95, max(0.74, (high["score"] + low["score"]) / 2 + 0.04))
+                        return low_value, combo_score
+
         if non_fee_candidates:
             non_fee_candidates.sort(key=lambda x: (x["score"], x["value"]), reverse=True)
             best = non_fee_candidates[0]
@@ -1494,7 +1635,10 @@ class RuleFieldParserV1:
         candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
         best_score, best_hour, best_minute = candidates[0]
 
-        if best_score < 0.25:
+        # Jika parsed awal sudah punya jam valid, jangan override kecuali
+        # kandidat pengganti sangat kuat (biasanya baris berlabel + tanggal).
+        min_override_score = 0.5 if (current_hour == 0 and current_minute == 0) else 1.05
+        if best_score < min_override_score:
             return parsed_date
 
         return f"{date_part} {best_hour:02d}:{best_minute:02d}"
@@ -1513,8 +1657,9 @@ class RuleFieldParserV1:
                 norm = re.sub(r"\b(wib|wit|wita)\b", " ", norm)
                 norm = norm.replace("|", "1")
                 norm = re.sub(r"\boi(?=\s*[a-z]{3,10}\s*20\d{2})", "01", norm)
-                norm = re.sub(r"\b[i1l][t7][:.]([0-5]\d)\b", r"14:\1", norm)
-                norm = re.sub(r"\bi[-]([0-5]\d)\b", r"14:\1", norm)
+                # Koreksi OCR DANA: "I7:35" -> "17:35", "I:06"/"I-06" -> "11:06".
+                norm = re.sub(r"\b[il][t7][:.]([0-5]\d)\b", r"17:\1", norm)
+                norm = re.sub(r"\b[il][-.]([0-5]\d)\b", r"11:\1", norm)
                 parsed = parse_noisy_transaction_date(norm)
                 if parsed:
                     return self._override_time_from_lines(parsed, ordered), 0.94

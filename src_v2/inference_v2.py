@@ -18,7 +18,7 @@ try:
     )
     from .ocr_engine import ReceiptOCREngine
     from .image_preprocess import resize_for_speed, light_preprocess
-    from .layout_parser import group_tokens_into_lines, build_page_text, normalize_number
+    from .layout_parser import group_tokens_into_lines, build_page_text, normalize_number, normalize_text
     from .template_router import TemplateRouter
     from .candidate_generator import CandidateGenerator
     from .feature_builder import build_candidate_matrix
@@ -26,6 +26,7 @@ try:
         RuleFieldParserV1,
         is_amount_candidate,
         is_human_name_candidate,
+        parse_rupiah_amount_ocr_aware,
         parse_noisy_transaction_date,
         safe_parse_date,
     )
@@ -40,7 +41,7 @@ except ImportError:
     )
     from ocr_engine import ReceiptOCREngine
     from image_preprocess import resize_for_speed, light_preprocess
-    from layout_parser import group_tokens_into_lines, build_page_text, normalize_number
+    from layout_parser import group_tokens_into_lines, build_page_text, normalize_number, normalize_text
     from template_router import TemplateRouter
     from candidate_generator import CandidateGenerator
     from feature_builder import build_candidate_matrix
@@ -48,6 +49,7 @@ except ImportError:
         RuleFieldParserV1,
         is_amount_candidate,
         is_human_name_candidate,
+        parse_rupiah_amount_ocr_aware,
         parse_noisy_transaction_date,
         safe_parse_date,
     )
@@ -126,6 +128,18 @@ class ReceiptFieldExtractorV2:
         # Rule parser V1 sebagai prioritas utama.
         rule_outputs = self.rule_parser.extract(lines=lines, template_name=template_name)
 
+        # Kasus tertentu (mis. BJBSyariah) amount nominal lebih terbaca di raw image
+        # dibanding hasil preprocess. Jalankan retry OCR raw secara selektif agar
+        # tidak menambah latency global secara signifikan.
+        if self.should_retry_amount_with_raw_ocr(lines, rule_outputs):
+            raw_amount, raw_score = self.retry_amount_with_raw_ocr(image, template_name)
+            if raw_amount is not None and raw_score > float(rule_outputs.get("total_amount", {}).get("confidence", 0.0)):
+                rule_outputs["total_amount"] = {
+                    "value": raw_amount,
+                    "confidence": raw_score,
+                    "source": "rules_v1_raw_ocr_retry",
+                }
+
         # Jalankan model fallback hanya untuk field rule yang lemah/kosong
         # agar latency lebih rendah.
         need_model_fields = []
@@ -187,6 +201,41 @@ class ReceiptFieldExtractorV2:
 
         return result
 
+    def should_retry_amount_with_raw_ocr(self, lines, rule_outputs):
+        current_amount = rule_outputs.get("total_amount", {}).get("value")
+        if current_amount is not None:
+            return False
+
+        has_nominal_label = False
+        has_fee_amount = False
+
+        for line in lines:
+            text = str(line.get("text", ""))
+            norm = normalize_text(text)
+
+            if "nominal" in norm:
+                has_nominal_label = True
+
+            if any(k in norm for k in ("biaya", "adm", "admin", "fee")):
+                if parse_rupiah_amount_ocr_aware(text) is not None:
+                    has_fee_amount = True
+
+        return has_nominal_label and has_fee_amount
+
+    def retry_amount_with_raw_ocr(self, raw_image, template_name):
+        try:
+            raw_tokens = self.ocr.run_ocr(raw_image)
+            raw_lines = group_tokens_into_lines(raw_tokens)
+            raw_rule = self.rule_parser.extract(lines=raw_lines, template_name=template_name)
+
+            amount = raw_rule.get("total_amount", {}).get("value")
+            score = float(raw_rule.get("total_amount", {}).get("confidence", 0.0))
+            if amount is None:
+                return None, 0.0
+            return amount, max(score, 0.8)
+        except Exception:
+            return None, 0.0
+
     def resolve_field_value(
         self,
         field,
@@ -201,6 +250,11 @@ class ReceiptFieldExtractorV2:
         has_rule = rule_value is not None
         has_model = model_value is not None
         model_valid = self.is_model_value_valid(field, model_value)
+
+        # Untuk kasus "No. Referensi" yang eksplisit kosong, parser memberi
+        # confidence tinggi meskipun value None. Ini harus dipertahankan sebagai null.
+        if field == "reference_no" and (rule_value is None) and (rule_score >= 0.95):
+            return None, rule_score, "rules_v1_explicit_null"
 
         if has_rule and rule_score >= 0.62:
             return rule_value, rule_score, "rules_v1"

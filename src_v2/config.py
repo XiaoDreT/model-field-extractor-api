@@ -40,3 +40,13 @@ MAX_AMOUNT = 100_000_000
 
 # Resize batas atas untuk menyeimbangkan akurasi dan latency OCR.
 OCR_MAX_WIDTH = 1100
+
+# OCR runtime tuning (CPU production)
+# Nilai ini dipakai untuk mengurangi overhead thread scheduling ORT pada beban
+# inferensi per-image yang relatif kecil.
+OCR_CPU_THREADS = 1
+
+# Tuning detector side length untuk mode cepat.
+# "min" mempertahankan sisi pendek pada ukuran ini.
+OCR_DET_LIMIT_SIDE_LEN = 560
+OCR_DET_LIMIT_TYPE = "min"
